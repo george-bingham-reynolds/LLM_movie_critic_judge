@@ -168,6 +168,12 @@ class Judge:
         message = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
+            # Explicitly disabled -- see generator.py for the full story on
+            # why this matters on claude-sonnet-5 (adaptive thinking is on
+            # by default there and ate into max_tokens, causing truncation).
+            # Not confirmed to be on-by-default for Haiku, but disabling
+            # costs nothing and removes the ambiguity for this short task.
+            thinking={"type": "disabled"},
             system=system_blocks,
             messages=[
                 {"role": "user", "content": user_message}
@@ -187,7 +193,11 @@ class Judge:
             cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
             cache_write = getattr(usage, 'cache_creation_input_tokens', 0) or 0
             print(f"  [cache] read={cache_read} tokens, written={cache_write} tokens, "
-                  f"fresh_input={usage.input_tokens}")
+                  f"fresh_input={usage.input_tokens}, output={usage.output_tokens}/{max_tokens}")
+
+        if message.stop_reason == "max_tokens":
+            print(f"  WARNING: response hit max_tokens ({max_tokens}) and was truncated. "
+                  f"Increase the per-item token budget in grade_batch() if this recurs.")
 
         return results
 
@@ -243,17 +253,11 @@ class Judge:
     def receive_feedback(self, feedback):
         """
         Add feedback to the judge's context for the next round.
-        
-        Keeps only the most recent 3 rounds of feedback to prevent context
-        from growing too large and confusing the model's JSON output.
 
         Args:
             feedback: Plain-language feedback string describing grading errors
         """
         self.feedback_history.append(feedback)
-        # Keep only the most recent 3 rounds to prevent context bloat
-        if len(self.feedback_history) > 3:
-            self.feedback_history = self.feedback_history[-3:]
         print(f"Judge received feedback (now {len(self.feedback_history)} rounds of feedback)")
 
 
