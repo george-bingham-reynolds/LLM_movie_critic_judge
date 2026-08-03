@@ -414,10 +414,363 @@ def main(threshold=0.9, max_rounds=5, seed=42):
     print("="*80)
 
 
+# ============================================================================
+# GENERATOR PHASE (Phase 2)
+# ============================================================================
+
+from generator import Generator
+from generator_prompts import prepare_generator_data, print_data_assignment_table
+
+
+def save_generations_to_file(generations, round_num):
+    """
+    Save generated reviews to human-readable files for manual spot-checking.
+    
+    Args:
+        generations: List of dicts with keys: prompt_id, prompt, generated_review
+        round_num: Round number (or "held_out")
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save as markdown for easy reading
+    md_filename = f"generations_round_{round_num}_{timestamp}.md"
+    with open(md_filename, 'w') as f:
+        f.write(f"# Generated Reviews - Round {round_num}\n")
+        f.write(f"Generated at: {timestamp}\n\n")
+        f.write("="*80 + "\n\n")
+        
+        for gen in generations:
+            f.write(f"## Prompt ID: {gen['prompt_id']}\n\n")
+            f.write(f"**Topic:** {gen['prompt']}\n\n")
+            f.write(f"**Generated Review:**\n\n")
+            f.write(gen['generated_review'])
+            f.write("\n\n" + "-"*80 + "\n\n")
+    
+    print(f"  Saved generated reviews to: {md_filename}")
+    
+    # Also save as JSON for programmatic access
+    json_filename = f"generations_round_{round_num}_{timestamp}.json"
+    with open(json_filename, 'w') as f:
+        json.dump(generations, f, indent=2)
+
+
+def compute_average_grade(judge_results):
+    """
+    Compute average numeric score from judge grades.
+    
+    Maps: GOOD=2, OK=1, BAD=0, then averages.
+    
+    Args:
+        judge_results: List of dicts with 'grade' key
+        
+    Returns:
+        float: Average score (0.0 to 2.0)
+    """
+    tier_to_num = {"BAD": 0, "OK": 1, "GOOD": 2}
+    scores = [tier_to_num[r['grade']] for r in judge_results]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def build_generator_feedback(generations, judge_results):
+    """
+    Build per-item feedback for generator from judge's grades and reasoning.
+    
+    Spec: Per-item detail (not aggregate) since aggregate feedback showed flat
+    improvement in judge's own calibration.
+    
+    Args:
+        generations: List of dicts with prompt_id, prompt, generated_review
+        judge_results: List of dicts with id, grade, reasoning
+        
+    Returns:
+        String containing per-item feedback
+    """
+    judge_by_id = {r['id']: r for r in judge_results}
+    
+    feedback_parts = []
+    
+    for gen in generations:
+        judge_result = judge_by_id.get(gen['prompt_id'])
+        if not judge_result:
+            continue
+        
+        grade = judge_result['grade']
+        reasoning = judge_result['reasoning']
+        
+        # Format as concrete, actionable feedback
+        if grade == 'BAD':
+            feedback_parts.append(
+                f"Prompt {gen['prompt_id']} ('{gen['prompt'][:40]}...'): "
+                f"NEEDS MAJOR IMPROVEMENT (graded BAD). Judge's critique: {reasoning}"
+            )
+        elif grade == 'OK':
+            feedback_parts.append(
+                f"Prompt {gen['prompt_id']} ('{gen['prompt'][:40]}...'): "
+                f"PARTIAL MATCH (graded OK). Judge's notes: {reasoning}"
+            )
+        else:  # GOOD
+            feedback_parts.append(
+                f"Prompt {gen['prompt_id']} ('{gen['prompt'][:40]}...'): "
+                f"STRONG MATCH (graded GOOD). Keep this quality."
+            )
+    
+    return "\n\n".join(feedback_parts)
+
+
+def run_generator_phase(judge, judge_few_shot, judge_calibration, judge_golden, 
+                       rubric_text, style_name, seed=42, max_rounds=3):
+    """
+    Run the generator feedback loop (Phase 2).
+    
+    Args:
+        judge: Calibrated judge instance
+        judge_few_shot: Judge's few-shot set (off-limits for generator)
+        judge_calibration: Judge's calibration set (available pool)
+        judge_golden: Judge's golden set (available pool)
+        rubric_text: Style rubric
+        style_name: Style name
+        seed: Random seed
+        max_rounds: Max generator rounds (default 3)
+        
+    Returns:
+        dict with round_history and held_out results
+    """
+    print(f"\n{'='*80}")
+    print("GENERATOR PHASE - ITERATIVE STYLE LEARNING")
+    print(f"{'='*80}\n")
+    
+    # Prepare generator data
+    gen_few_shot, gen_tracking, gen_held_out = prepare_generator_data(
+        judge_few_shot, judge_calibration, judge_golden, seed=seed
+    )
+    
+    # Print assignment table (required by spec)
+    print_data_assignment_table(
+        judge_few_shot, judge_calibration, judge_golden,
+        gen_few_shot, gen_tracking, gen_held_out
+    )
+    
+    # Initialize generator
+    print(f"Initializing generator for style: {style_name}\n")
+    generator = Generator(
+        rubric_text=rubric_text,
+        style_name=style_name,
+        few_shot_examples=gen_few_shot
+    )
+    
+    # Generator feedback loop
+    print(f"{'='*80}")
+    print(f"GENERATOR FEEDBACK LOOP (max {max_rounds} rounds)")
+    print(f"{'='*80}")
+    print(f"Round-tracking prompts: {len(gen_tracking)} (fixed, same every round)")
+    print(f"Held-out prompts: {len(gen_held_out)} (used once at end)\n")
+    
+    round_history = []
+    
+    for round_num in range(1, max_rounds + 1):
+        print(f"\n{'-'*80}")
+        print(f"Generator Round {round_num}")
+        print(f"{'-'*80}")
+        
+        # 1. Generator writes reviews
+        print(f"\nStep 1: Generating reviews for {len(gen_tracking)} prompts...")
+        generations = generator.generate_batch(gen_tracking)
+        
+        # 2. Save generated text
+        print(f"Step 2: Saving generated reviews...")
+        save_generations_to_file(generations, round_num)
+        
+        # 3. Judge scores generated reviews
+        print(f"Step 3: Judge scoring generated reviews...")
+        judge_input = [
+            {"id": g["prompt_id"], "prompt": g["prompt"], "response_text": g["generated_review"]}
+            for g in generations
+        ]
+        judge_results = judge.grade_batch(judge_input)
+        
+        # 4. Compute average score
+        round_avg_score = compute_average_grade(judge_results)
+        
+        # Count grades
+        grade_counts = defaultdict(int)
+        for r in judge_results:
+            grade_counts[r['grade']] += 1
+        
+        round_history.append({
+            'round': round_num,
+            'avg_score': round_avg_score,
+            'grade_counts': dict(grade_counts),
+            'individual_grades': judge_results,
+            'generations': generations
+        })
+        
+        print(f"\nRound {round_num} results:")
+        print(f"  Average judge score: {round_avg_score:.2f} / 2.0 ({round_avg_score/2.0:.1%})")
+        print(f"  Grade distribution: GOOD={grade_counts['GOOD']}, OK={grade_counts['OK']}, BAD={grade_counts['BAD']}")
+        
+        # 5. Build and deliver per-item feedback
+        if round_num < max_rounds:
+            print(f"\nStep 4: Building per-item feedback for next round...")
+            feedback = build_generator_feedback(generations, judge_results)
+            print(f"\n  Feedback for next round:")
+            for line in feedback.split('\n'):
+                print(f"    {line}")
+            generator.receive_feedback(feedback)
+    
+    # Final round: held-out prompts (one-shot, no feedback after)
+    print(f"\n{'='*80}")
+    print(f"GENERATOR HELD-OUT CHECK (generalization test)")
+    print(f"{'='*80}\n")
+    
+    print(f"Generating reviews for {len(gen_held_out)} held-out prompts...")
+    held_out_generations = generator.generate_batch(gen_held_out)
+    
+    print(f"Saving held-out generations...")
+    save_generations_to_file(held_out_generations, "held_out")
+    
+    print(f"Judge scoring held-out generations...")
+    held_out_judge_input = [
+        {"id": g["prompt_id"], "prompt": g["prompt"], "response_text": g["generated_review"]}
+        for g in held_out_generations
+    ]
+    held_out_judge_results = judge.grade_batch(held_out_judge_input)
+    
+    held_out_avg_score = compute_average_grade(held_out_judge_results)
+    held_out_grade_counts = defaultdict(int)
+    for r in held_out_judge_results:
+        held_out_grade_counts[r['grade']] += 1
+    
+    print(f"\nHeld-out results:")
+    print(f"  Average judge score: {held_out_avg_score:.2f} / 2.0 ({held_out_avg_score/2.0:.1%})")
+    print(f"  Grade distribution: GOOD={held_out_grade_counts['GOOD']}, OK={held_out_grade_counts['OK']}, BAD={held_out_grade_counts['BAD']}")
+    
+    final_round_score = round_history[-1]['avg_score']
+    gap = final_round_score - held_out_avg_score
+    
+    print(f"\nGeneralization check:")
+    print(f"  Final round-tracking score: {final_round_score:.2f}")
+    print(f"  Held-out score: {held_out_avg_score:.2f}")
+    print(f"  Gap: {gap:+.2f} {'(good generalization)' if abs(gap) < 0.3 else '(possible prompt-specific patching)'}")
+    
+    return {
+        'round_history': round_history,
+        'held_out': {
+            'avg_score': held_out_avg_score,
+            'grade_counts': dict(held_out_grade_counts),
+            'individual_grades': held_out_judge_results,
+            'generations': held_out_generations
+        }
+    }
+
+
+def main(threshold=0.9, max_rounds=5, seed=42, generator_trigger_threshold=0.80):
+    """
+    Main harness entry point - runs judge calibration, then generator phase if triggered.
+
+    Args:
+        threshold: Judge exact match rate threshold for calibration exit
+        max_rounds: Maximum judge calibration rounds
+        seed: Random seed for reproducibility
+        generator_trigger_threshold: Golden-set threshold to trigger generator phase
+    """
+    random.seed(seed)
+
+    print("="*80)
+    print("LLM JUDGE CALIBRATION HARNESS - PHASE 1 & 2")
+    print("="*80)
+
+    # ===== PHASE 1: JUDGE CALIBRATION =====
+    print("\n" + "="*80)
+    print("PHASE 1: JUDGE CALIBRATION")
+    print("="*80)
+    
+    print("\nLoading and preparing data...")
+    few_shot_set, calibration_set, golden_set, rubric_text = prepare_data(seed=seed)
+    style_name = extract_rubric_name(rubric_text)
+
+    print(f"\nInitializing judge for style: {style_name}")
+    judge = Judge(
+        rubric_text=rubric_text,
+        style_name=style_name,
+        few_shot_examples=few_shot_set
+    )
+
+    calibration_history = run_calibration(
+        judge=judge,
+        calibration_set=calibration_set,
+        max_rounds=max_rounds,
+        threshold=threshold
+    )
+
+    golden_results = run_golden_check(judge, golden_set)
+
+    print(f"\n{'='*80}")
+    print("GENERATING PHASE 1 REPORT")
+    print(f"{'='*80}")
+
+    report_text = generate_report(
+        style_name=style_name,
+        calibration_history=calibration_history,
+        golden_results=golden_results,
+        calibration_size=len(calibration_set),
+        golden_size=len(golden_set),
+        threshold=threshold
+    )
+
+    print("\n" + report_text)
+
+    save_report(report_text, calibration_history, golden_results)
+
+    print("\n" + "="*80)
+    print("PHASE 1 COMPLETE!")
+    print("="*80)
+    
+    # ===== PHASE 2: GENERATOR (golden-gated trigger) =====
+    print(f"\n{'='*80}")
+    print(f"PHASE 2: GENERATOR TRIGGER CHECK")
+    print(f"{'='*80}")
+    
+    golden_performance = golden_results['exact_match_rate']
+    
+    if golden_performance >= generator_trigger_threshold:
+        print(f"\n✓ Golden set performance ({golden_performance:.1%}) cleared trigger threshold ({generator_trigger_threshold:.0%}).")
+        print(f"  Proceeding to generator phase...\n")
+        
+        generator_results = run_generator_phase(
+            judge=judge,
+            judge_few_shot=few_shot_set,
+            judge_calibration=calibration_set,
+            judge_golden=golden_set,
+            rubric_text=rubric_text,
+            style_name=style_name,
+            seed=seed,
+            max_rounds=3
+        )
+        
+        print(f"\n{'='*80}")
+        print("PHASE 2 COMPLETE!")
+        print("="*80)
+        
+        # Print summary
+        print(f"\nGenerator improvement summary:")
+        for round_data in generator_results['round_history']:
+            print(f"  Round {round_data['round']}: avg score = {round_data['avg_score']:.2f}")
+        print(f"  Held-out: avg score = {generator_results['held_out']['avg_score']:.2f}")
+        
+    else:
+        print(f"\n✗ Golden set performance ({golden_performance:.1%}) below trigger threshold ({generator_trigger_threshold:.0%}).")
+        print(f"  Generator phase skipped. Judge needs further calibration first.")
+    
+    print(f"\n{'='*80}")
+    print("ALL PHASES COMPLETE!")
+    print("="*80)
+
+
 if __name__ == "__main__":
-    # Default threshold: 0.9
+    # Default threshold: 0.9 for judge calibration
+    # Generator trigger: 0.80 (lower than judge target, but shows judge is working)
     # Justification: With 3 tiers, random baseline is ~33%.
     # 90% exact match is nearly 3x random, showing meaningful signal.
-    # It's also achievable given the balanced tier distribution in the dataset.
+    # 80% trigger ensures judge is validated before generator runs.
 
-    main(threshold=0.9, max_rounds=5, seed=42)
+    main(threshold=0.9, max_rounds=5, seed=42, generator_trigger_threshold=0.80)
